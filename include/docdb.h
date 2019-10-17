@@ -35,11 +35,10 @@ struct Document {
 
 class DocumentDB {
  public:
-    virtual ~DocumentDB() {}
-    virtual bool test(ID) const = 0;
-    virtual int get(ID, Document&) const = 0;
+    virtual bool exists(ID) const = 0;
+    virtual int get(ID, Document*) const = 0;
     virtual int remove(ID) = 0;
-    virtual int update(ID, const std::string data) = 0;
+    virtual int update(ID, const std::string&) = 0;
     virtual int insert(const Document&) = 0;
 };
 

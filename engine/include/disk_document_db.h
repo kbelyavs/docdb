@@ -27,24 +27,21 @@ SOFTWARE.
 #include <string>
 
 #include "docdb.h"
+#include "vfs.h"
 
 class DiskDocumentDB : public DocumentDB {
  public:
-    DiskDocumentDB();
-    ~DiskDocumentDB();
-    bool test(ID) const override {return true;}
-    int get(ID, Document&) const override {return 0;};
-    int remove(ID) override {return 0;};
-    int update(ID, const std::string data) override {return 0;};
-    int insert(const Document&) override {return 0;};
+    DiskDocumentDB(): vfs() {std::cout << "An instance of DocDB is created\n";}
+    ~DiskDocumentDB() {std::cout << "An instance of DocDB is destroyed\n";}
+    bool exists(ID id) const override {return vfs.exists(id);}
+    int get(ID id, Document* doc) const override {return vfs.get(id, doc);};
+    int remove(ID id) override {return vfs.remove(id);};
+    int update(ID id, const std::string& data) override {
+        return vfs.update(id, data);
+    };
+    int insert(const Document& doc) override {return vfs.insert(doc);};
+ private:
+    VFS vfs;
 };
-
-DiskDocumentDB::DiskDocumentDB() {
-    std::cout << "An instance of DocDB is created\n";
-}
-
-DiskDocumentDB::~DiskDocumentDB() {
-    std::cout << "An instance of DocDB is destroyed\n";
-}
 
 #endif  // ENGINE_INCLUDE_DISK_DOCUMENT_DB_H_

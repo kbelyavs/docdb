@@ -28,5 +28,6 @@ SOFTWARE.
 
 int main(int argc, char *argv[]) {
     DocumentDB& db = get_instance();
+    db.exists(1);
     return 0;
 }
