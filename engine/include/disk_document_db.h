@@ -34,12 +34,16 @@ class DiskDocumentDB : public DocumentDB {
     DiskDocumentDB(): vfs() {std::cout << "An instance of DocDB is created\n";}
     ~DiskDocumentDB() {std::cout << "An instance of DocDB is destroyed\n";}
     bool exists(ID id) const override {return vfs.exists(id);}
-    int get(ID id, Document* doc) const override {return vfs.get(id, doc);};
+    int get(ID id, Document* doc) const override {
+        return vfs.get(id, doc->data);
+    };
     int remove(ID id) override {return vfs.remove(id);};
     int update(ID id, const std::string& data) override {
         return vfs.update(id, data);
     };
-    int insert(const Document& doc) override {return vfs.insert(doc);};
+    int insert(const Document& doc) override {
+        return vfs.insert(doc.id, doc.data);
+    };
  private:
     VFS vfs;
 };
