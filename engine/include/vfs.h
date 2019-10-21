@@ -157,69 +157,64 @@ int write_header(const std::string &path, const FileHeader *hdr) {
     return ret;
 }
 
-using std::mutex;
-using std::lock_guard;
-using ID = int64_t;
-
-class VFS {
- public:
-    VFS(): path(current_dir() + "/db") { recover(); }
-    bool exists(ID id) const {lock_guard<mutex> l(mtx); return cache.count(id);}
-    int get(ID, std::string&) const;
-    int remove(ID);
-    int update(ID, const std::string&);
-    int insert(ID, const std::string&);
- private:
-    int _insert() { return -1; }
-    int _update() { return -1; }
-    int find_file(ID, std::string&, ID* file_id = nullptr) const;
-    void recover();
-    void recover_file(const std::string&);
-    std::string path;
-    mutable mutex mtx;
-    std::map<ID, int> space;  // keep number of entries in closest DB file
-    std::unordered_set<ID> cache;  // to check if record exists
-};
-
 std::string get_fullpath(ID id, const std::string &rel_path) {
     char name[FLENGTH + 1];
     snprintf(name, FLENGTH + 1, "%020lld", id);
     return rel_path + "/" + std::string(name);
 }
 
-int VFS::find_file(ID id, std::string &fullpath, ID *file_id) const {
-    bool found = exists(id);
+using std::mutex;
+using std::lock_guard;
+using ID = int64_t;
+enum class Opp { INSERT, UPDATE, DELETE };
+
+class VFS {
+ public:
+    VFS(): path(current_dir() + "/db") { recover(); }
+    bool exists(ID id) const {lock_guard<mutex> l(mtx); return cache.count(id);}
+    int get(ID, std::string&) const;
+    int remove(ID id) { return do_magic(id, Opp::DELETE, empty); }
+    int update(ID id, const std::string &data) {
+        return do_magic(id, Opp::UPDATE, data);
+    }
+    int insert(ID id, const std::string &data) {
+        return do_magic(id, Opp::INSERT, data);
+    }
+ private:
+    ID find_file(ID) const;
+    int do_magic(ID, Opp, const std::string&);
+    void recover();
+    void recover_file(const std::string&);
+    std::string path;
+    mutable mutex mtx;
+    std::map<ID, int> space;  // keep number of entries in closest DB file
+    std::unordered_set<ID> cache;  // to check if record exists
+    const std::string empty = "";
+};
+
+ID VFS::find_file(ID id) const {
     auto it = space.upper_bound(id);
-    if (it == space.begin()) {
-        fullpath = "";
-        if (file_id)
-            *file_id = 0;
-        if (found) {
-            std::cerr << "Critical error: exists in cache, but no file found";
-            return -2;
-        }
+    if (it == space.begin())
         return -1;
-    }
     --it;
-    ID _file_id = it->first;
-    if (file_id)
-        *file_id = _file_id;
-    fullpath = get_fullpath(_file_id, path);
-    std::cout << "for record " << id << " file " << fullpath << std::endl;
-    if (found && it->second == 0) {
-        std::cerr << "Critical error: exists in cache, but the file is empty";
-        return -3;
-    }
-    if (!found)
-        return -1;
-    return 0;
+    return it->first;
 }
 
 int VFS::get(ID id, std::string &data) const {
     lock_guard<mutex> l(mtx);
-    std::string fullpath;
-    if (find_file(id, fullpath) < 0)
+    if (!exists(id))
         return -1;
+    ID file_id = find_file(id);
+    if (file_id < 0) {
+        std::cerr << "Critical error: exists in cache, but no file found";
+        return -1;
+    }
+    if (space.at(file_id) == 0) {
+        std::cerr << "Critical error: exists in cache, but the file is empty";
+        return -1;
+    }
+    std::string fullpath = get_fullpath(file_id, path);
+    std::cout << "for record " << id << " file " << fullpath << std::endl;
     FileHeader hdr;
     if (read_header(fullpath, &hdr) == 0) {
         for (int i = 0; i < NFILES; i++) {
@@ -236,193 +231,187 @@ int VFS::get(ID id, std::string &data) const {
             }
         }
     }
+    std::cerr << "Critical error: exists in cache, but not found in file";
     return -1;
 }
 
-int VFS::remove(ID id) {
+int VFS::do_magic(ID id, Opp opp, const std::string &data) {
     lock_guard<mutex> l(mtx);
-    std::string fullpath;
-    ID file_id;
-    int ret = find_file(id, fullpath, &file_id);
-    cache.erase(id);  // in any case, remove entry
-    if (ret < 0)
-        return -1;
-    if (space[file_id] < 2) {  // simply remove file, since only one record
-        space.erase(file_id);
-        return remove_file(fullpath);
+    if (exists(id)) {
+        if (opp == Opp::INSERT)
+            opp = Opp::UPDATE;
+    } else {
+        if (opp == Opp::DELETE)
+            return -1;  // error, no entry found
+        if (opp == Opp::UPDATE)
+            opp = Opp::INSERT;
     }
-    FileHeader hdr;
-    if (read_header(fullpath, &hdr) == 0) {
-        for (int i = 0; i < NFILES; i++) {
-            if (hdr.header[i].offset == 0 || hdr.header[i].id > id) {
+    ID file_id = find_file(id);  // < 0 - error, not found
+    std::string src, dst, new_name;
+    bool read_entry = false;
+    bool write_etry_new = true;  // need to write new value (INSERT/UPDATE)
+    bool read_write_after = true;  // move data after insert/update/delete row
+    bool need_truncate = true;
+    FileHeader *srcHdr = nullptr, *dstHdr = nullptr;
+    int ret = -1;  // an error by default
+    std::vector<char> cbuf;
+    while (true) {  // goto workaround, in case of error move to the end
+        switch (opp) {
+        case Opp::INSERT:
+            if (file_id >= 0) {
+                src = get_fullpath(file_id, path);
+                if (space[file_id] < NFILES) {  // enough space
+                    dst = src;
+                    need_truncate = false;
+                } else {  // new file created, may be data move
+                    dst = get_fullpath(id, path);
+                }
+            } else {  // new file created, no data move
+                read_write_after = false;
+                need_truncate = false;
+                dst = get_fullpath(id, path);
+            }
+            break;
+        case Opp::UPDATE:
+            if (file_id < 0)
+                return -2;  // critical error, exists in cache, buf no file
+            read_entry = true;
+            src = dst = get_fullpath(file_id, path);
+            break;
+        case Opp::DELETE:
+            cache.erase(id);  // in any case, remove entry
+            if (file_id < 0)
+                return -2;  // critical error, was in cache, buf no file
+            src = dst = get_fullpath(file_id, path);
+            break;
+        }
+        size_t hdr_size = sizeof(FileHeader);
+        if (src.length() != 0)
+            srcHdr = new FileHeader;
+        dstHdr = (dst == src) ? srcHdr : new FileHeader;
+        if (srcHdr)
+            if (read_header(src, srcHdr) != 0)
                 break;
-            } else if (hdr.header[i].id == id) {
-                size_t size = hdr.header[i].size;
-                size_t offset = hdr.header[i].offset;
-                size_t bytes_total = 0;
-                int j;
-                for (j = i+1; j < NFILES; j++) {
-                    if (hdr.header[j].offset == 0)
-                        break;
-                    hdr.header[j].offset -= size;
-                    bytes_total += hdr.header[j].size;
-                }
-                if (j != i+1)  // to shift the rest of the entries if any
-                    memmove(reinterpret_cast<Entry*>(&hdr) + i,
-                            reinterpret_cast<Entry*>(&hdr) + i+1,
-                            sizeof(Entry) * (j - i - 1));
-                hdr.header[j].offset = 0;  // invalidate last record
-                write_header(fullpath, &hdr);
-                std::vector<char> cbuf(bytes_total);
-                read_file(fullpath, cbuf.data(), bytes_total, offset+size);
-                write_file(fullpath, cbuf.data(), bytes_total, offset, true);
-                space[file_id]--;
-                if (i == 0) {
-                    char newname[FLENGTH + 1];
-                    snprintf(newname, FLENGTH + 1, "%020lld", hdr.header[0].id);
-                    return rename_file(fullpath, path+"/"+std::string(newname));
-                }
-                return 0;
-            }
-        }
-        std::cout << "Critical error: can't find record " << id << " in "
-                  << fullpath << std::endl;
-    }
-    return -1;
-}
-
-int VFS::update(ID id, const std::string &data) {
-    lock_guard<mutex> l(mtx);
-    std::string fullpath;
-    if (find_file(id, fullpath) < 0)
-        return -1;
-    FileHeader hdr;
-    if (read_header(fullpath, &hdr) == 0) {
-        for (int i = 0; i < NFILES; i++) {
-            if (hdr.header[i].offset == 0 || hdr.header[i].id > id) {
+        if (dstHdr != srcHdr)  // initialize with zero
+            memset(dstHdr, 0, hdr_size);
+        if (opp == Opp::DELETE) {
+            if (space[file_id] < 2) {
+                assert(space[file_id] == 1);
+                assert(srcHdr->header[0].id == id);
+                assert(srcHdr->header[1].offset == 0);
+                space.erase(file_id);
+                ret = remove_file(src);
                 break;
-            } else if (hdr.header[i].id == id) {
-                size_t size = hdr.header[i].size;
-                size_t offset = hdr.header[i].offset;
-                if (data.size() == size)
-                    return write_file(fullpath, data.c_str(), size, offset);
-                hdr.header[i].size = data.size();  // update size
-                size_t bytes_total = 0, delta = data.size() - size;
-                int j;
-                for (j = i+1; j < NFILES; j++) {
-                    if (hdr.header[j].offset == 0)
-                        break;
-                    hdr.header[j].offset += delta;
-                    bytes_total += hdr.header[j].size;
-                }
-                write_header(fullpath, &hdr);
-                std::vector<char> cbuf(data.size() + bytes_total);
-                memmove(cbuf.data(), data.c_str(), data.size());
-                if (bytes_total) {  // need to shift rest of record's data
-                    size_t offset = hdr.header[i+1].offset;
-                    read_file(fullpath, cbuf.data()+data.size(), bytes_total,
-                              offset+size);
-                }
-                write_file(fullpath, cbuf.data(), cbuf.size(), offset,
-                           delta < 0);  // update and resize if needed
-                return 0;
+            }
+            if (srcHdr->header[0].id == id)
+                new_name = get_fullpath(srcHdr->header[1].id, path);
+        }
+        int next_pos = NFILES;
+        for (int i = 0; i < NFILES; i++)
+            if (srcHdr->header[i].offset == 0 || srcHdr->header[i].id > id) {
+                next_pos = i;
+                break;
+            }
+        assert(next_pos > 0);
+        if (opp == Opp::UPDATE || opp == Opp::DELETE)
+            assert(srcHdr->header[next_pos-1].id == id);
+        size_t bytes = 0;  // how much data to move, if any
+        if (read_write_after) {
+            for (int i = next_pos; i < NFILES; i++) {
+                if (srcHdr->header[i].offset == 0)
+                    break;
+                bytes += srcHdr->header[i].size;
             }
         }
+        int dst_pos = (src == dst) ? (next_pos - 1) : 0;
+        if (read_write_after && bytes == 0)
+            read_write_after = false;  // nothing to write
+        size_t offset, size;
+        int shift;
+        // At first read data
+        if (read_write_after) {
+            offset = srcHdr->header[next_pos].offset;
+            size = srcHdr->header[next_pos].size;
+            cbuf.reserve(size);
+            read_file(src, cbuf.data(), cbuf.size(), offset);
+        }
+        // Then update header(s)
+        int n_rows = 0;
+        if (read_write_after) {
+            switch (opp) {
+             case Opp::DELETE:
+                shift = -srcHdr->header[next_pos - 1].size;
+                break;
+             case Opp::UPDATE:
+                shift = data.size() - srcHdr->header[next_pos - 1].size;
+                break;
+             case Opp::INSERT:
+                if (src == dst) {
+                    shift = data.size();
+                } else {  // new file
+                    dstHdr->header[0].offset = hdr_size;
+                    dstHdr->header[0].size = data.size();
+                    shift = hdr_size + data.size() -
+                            srcHdr->header[next_pos].offset;
+                }
+                break;
+            }
+            for (int i = next_pos; i < NFILES; i++) {
+                if (srcHdr->header[i].offset == 0)
+                    break;
+                srcHdr->header[i].offset += shift;  // update offsets
+                n_rows++;
+            }
+            int pos_shift = 1;
+            if (opp == Opp::DELETE)
+                pos_shift = 0;
+            if (src != dst || (dst_pos + pos_shift) != next_pos)
+                memmove(&dstHdr->header[dst_pos + pos_shift],
+                        &srcHdr->header[next_pos],
+                        sizeof(Entry) * n_rows);
+            if (opp != Opp::DELETE)  // no need to update offset
+                dstHdr->header[dst_pos].size = data.size();
+            else
+                srcHdr->header[next_pos + n_rows - 1].offset = 0;
+            if (opp == Opp::INSERT && src != dst) {
+                for (int i = next_pos; i < NFILES; i++)
+                    srcHdr->header[i].offset = 0;
+            }
+        }
+        // Write updated header(s)
+        write_header(src, srcHdr);
+        write_header(dst, dstHdr);
+        // And finally write data
+        if (write_etry_new) {  // write new entry to dst, if needed
+            write_file(dst, data.c_str(), data.size(),
+                       dstHdr->header[dst_pos].offset);
+            dst_pos++;
+        }
+        if (read_write_after) {
+            if (need_truncate && src != dst) {
+                write_file(src, nullptr, 0, offset, true);  // truncate src only
+                need_truncate = false;
+            }
+            offset = dstHdr->header[dst_pos].offset;
+            write_file(dst, cbuf.data(), cbuf.size(), offset, need_truncate);
+        }
+        // end of function body
+        ret = 0;
+        break;
     }
-    return -1;
-}
-
-int VFS::insert(ID id, const std::string &data) {
-    lock_guard<mutex> l(mtx);
-    std::string fullpath;
-    ID file_id;
-    int ret = find_file(id, fullpath, &file_id);  // somehow should get file_id!
-    if (ret == 0)  // record already exists, update
-        return _update();  // TODO(kbelyavs)
-
-    cache.insert(id);  // in any case, add entry
-    size_t hdr_size = sizeof(FileHeader);
-    if (fullpath.length() != 0 && space[file_id] < NFILES) {
-        // simple case: file found, free space exists, move code to _insert();
-        space[file_id]++;
-        FileHeader hdr;
-        if (read_header(fullpath, &hdr) == 0) {
-            int i;
-            for (i = 0; i < NFILES; i++)
-                if (hdr.header[i].offset == 0 || hdr.header[i].id > id)
-                    break;
-            bool tomove = false;
-            if (hdr.header[i].offset != 0) {
-                tomove = true;
-                int j;
-                for (j = NFILES-1; j > i; j--) {
-                    if (hdr.header[j-1].offset == 0)
-                        continue;
-                    hdr.header[j].size = hdr.header[j-1].size;
-                    hdr.header[j].offset = hdr.header[j-1].offset + data.size();
-                }
-            }
-            hdr.header[i].size = data.size();
-            hdr.header[i].offset = (i > 0) ? hdr.header[i-1].offset :
-                                             sizeof(hdr);
-            if (!tomove) {
-                write_header(fullpath, &hdr);
-                write_file(fullpath, data.c_str(), data.size(),
-                           hdr.header[i].offset);
-            } else {
-                assert(1);  // TODO(kbelyavs)
-            }
-            return 0;
-        }
-    } else {  // have to create a new file and may be move some entries
-        std::vector<char> cbuf(hdr_size + data.size());
-        FileHeader *hdr = reinterpret_cast<FileHeader*>(cbuf.data());
-        hdr->header[0].offset = hdr_size;
-        hdr->header[0].size = data.size();
-        memcpy(cbuf.data() + hdr_size, data.c_str(), data.size());
-        std::string newpath = get_fullpath(id, path);
-        write_file(newpath, cbuf.data(), cbuf.size());
-        space[id] = 1;
-        if (fullpath.length() == 0)
-            return 0;
-        // move all entries from fullpath with ID > id, if any
-        FileHeader hdr2;
-        if (read_header(fullpath, &hdr2) == 0) {
-            int i;
-            for (i = 0; i < NFILES; i++)
-                if (hdr2.header[i].offset != 0 && hdr2.header[i].id > id)
-                    break;
-            if (i == NFILES)
-                return 0;  // nothing to move
-            size_t size = hdr2.header[i].size;
-            size_t offset = hdr2.header[i].offset;
-            hdr->header[1].size = size;
-            hdr->header[1].offset = hdr->header[0].offset + hdr->header[0].size;
-            int k = 2;
-            for (int j = i+1; j < NFILES; j++) {  // merge two loops
-                if (hdr2.header[j].offset == 0)
-                    break;
-                hdr2.header[j].offset = 0;  // invalidate record
-                size += hdr2.header[j].size;
-                hdr->header[k].size = hdr2.header[j].size;
-                hdr->header[k].offset = hdr->header[k-1].offset +
-                                        hdr->header[k-1].size;
-                k++;
-            }
-            std::vector<char> cbuf(size);
-            // read data
-            read_file(fullpath, cbuf.data(), size, offset);
-            // update old (fullpath) file's header and truncate
-            write_header(fullpath, &hdr2);
-            write_file(fullpath, nullptr, 0, offset, true);
-            // write header and data
-            write_header(newpath, hdr);
-            write_file(newpath, cbuf.data(), cbuf.size(),
-                       hdr->header[1].offset);
-            return 0;
-        }
-    }
-    return -1;
+    // resource deallocation and error handling
+    if (opp == Opp::INSERT)
+        cache.insert(id);  // add entry
+    if (srcHdr)
+        delete srcHdr;
+    if (dstHdr != srcHdr)
+        delete dstHdr;
+    if (new_name.length() > 0)
+        if (rename_file(dst, new_name) != 0)
+            ret = -1;
+    if (ret)
+        return ret;
+    return 0;
 }
 
 void VFS::recover() {
