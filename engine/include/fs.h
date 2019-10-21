@@ -72,7 +72,7 @@ int read_file(const std::string &path, char *buf, size_t size,
               size_t offset = 0) {
     struct stat info;
     if (stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) {
-        std::ifstream file(path);
+        std::ifstream file(path, std::ios::binary);
         if (offset)
             file.seekg(offset);
         file.read(buf, size);
@@ -85,14 +85,19 @@ int read_file(const std::string &path, char *buf, size_t size,
 int write_file(const std::string &path, const char *buf, size_t size,
                size_t offset = 0, bool need_truncate = false) {
     struct stat info;
-    if ((stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) && size) {
-        std::ofstream outfile;
+    if ((stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) || size) {
         bool good = true;
         if (size) {
-            outfile.open(path);
+            std::ofstream outfile(path,
+                std::ios::binary | std::ios::in | std::ios::out);
+            if (outfile.tellp() == -1) {  // new file
+                assert(offset == 0);
+                outfile.open(path, std::ios::binary);
+            }
             if (offset)
                 outfile.seekp(offset);
             outfile.write(buf, size);
+            outfile.close();
             good = outfile.good();
         }
         if (good && need_truncate)

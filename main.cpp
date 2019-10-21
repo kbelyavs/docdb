@@ -28,6 +28,43 @@ SOFTWARE.
 
 int main(int argc, char *argv[]) {
     DocumentDB& db = get_instance();
-    db.exists(1);
+
+    Document doc1 = {101, "file1.txt"};
+    Document doc2 = {102, "file2.json"};
+    assert(db.exists(doc1.id) == false);
+    assert(db.insert(doc1) == 0);
+    assert(db.exists(doc1.id) == true);
+    Document doc;
+    assert(db.get(doc1.id, &doc) == 0);
+    assert(doc.id == doc1.id);
+    assert(doc.data == doc1.data);
+    std::cout << "Test1 complete\n";
+    assert(db.exists(doc2.id) == false);
+    assert(db.get(doc2.id, &doc) < 0);
+    assert(db.insert(doc2) == 0);
+    assert(db.exists(doc2.id) == true);
+    assert(db.get(doc2.id, &doc) == 0);
+    assert(db.remove(doc2.id) == 0);
+    assert(db.exists(doc2.id) == false);
+    std::cout << "Test2 complete\n";
+    assert(db.insert(doc2) == 0);
+    assert(db.exists(doc2.id) == true);
+    assert(db.update(doc2.id, doc1.data) == 0);
+    assert(db.exists(doc2.id) == true);
+    assert(db.get(doc2.id, &doc) == 0);
+    assert(doc.id == doc2.id);
+    assert(doc.data == doc1.data);
+    std::cout << "Test3 complete\n";
+    assert(db.remove(doc1.id) == 0);
+    assert(db.exists(doc1.id) == false);
+    assert(db.exists(doc2.id) == true);
+    assert(db.get(doc2.id, &doc) == 0);
+    assert(db.remove(doc2.id) == 0);
+    assert(db.exists(doc2.id) == false);
+    std::cout << "Test4 complete\n";
+    /*for (int i = 0; i < 1000; i++) {
+        doc1.id = i;
+        assert(db.insert(doc1) == 0);
+    }*/
     return 0;
 }

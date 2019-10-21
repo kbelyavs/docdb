@@ -73,7 +73,7 @@ int write_header(const std::string &path, const FileHeader *hdr) {
 
 std::string get_fullpath(ID id, const std::string &rel_path) {
     char name[FLENGTH + 1];
-    snprintf(name, FLENGTH + 1, "%020lld", id);
+    snprintf(name, FLENGTH + 1, "%020lld%s", id, FILE_EXT);
     return rel_path + "/" + std::string(name);
 }
 
@@ -116,19 +116,18 @@ ID VFS::find_file(ID id) const {
 
 int VFS::get(ID id, std::string &data) const {
     lock_guard<mutex> l(mtx);
-    if (!exists(id))
+    if (cache.count(id) == 0)
         return -1;
     ID file_id = find_file(id);
     if (file_id < 0) {
-        std::cerr << "Critical error: exists in cache, but no file found";
+        std::cerr << "Critical error: exists in cache, but no file found\n";
         return -1;
     }
     if (space.at(file_id) == 0) {
-        std::cerr << "Critical error: exists in cache, but the file is empty";
+        std::cerr << "Critical error: exists in cache, but the file is empty\n";
         return -1;
     }
     std::string fullpath = get_fullpath(file_id, path);
-    std::cout << "for record " << id << " file " << fullpath << std::endl;
     FileHeader hdr;
     if (read_header(fullpath, &hdr) == 0) {
         for (int i = 0; i < NFILES; i++) {
@@ -145,13 +144,13 @@ int VFS::get(ID id, std::string &data) const {
             }
         }
     }
-    std::cerr << "Critical error: exists in cache, but not found in file";
+    std::cerr << "Critical error: exists in cache, but not found in file\n";
     return -1;
 }
 
 int VFS::do_magic(ID id, Opp opp, const std::string &data) {
     lock_guard<mutex> l(mtx);
-    if (exists(id)) {
+    if (cache.count(id) > 0) {
         if (opp == Opp::INSERT)
             opp = Opp::UPDATE;
     } else {
@@ -160,12 +159,13 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
         if (opp == Opp::UPDATE)
             opp = Opp::INSERT;
     }
-    ID file_id = find_file(id);  // < 0 - error, not found
+    ID new_file_id = -1, file_id = find_file(id);  // < 0 - error, not found
     std::string src, dst, new_name;
     bool read_entry = false;
     bool write_etry_new = true;  // need to write new value (INSERT/UPDATE)
     bool read_write_after = true;  // move data after insert/update/delete row
     bool truncate = true;
+    int pos_shift = 0;
     FileHeader *srcHdr = nullptr, *dstHdr = nullptr;
     int ret = -1;  // an error by default
     std::vector<char> cbuf;
@@ -177,6 +177,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 if (space[file_id] < NFILES) {  // enough space
                     dst = src;
                     truncate = false;
+                    pos_shift = 1;
                 } else {  // new file created, may be data move
                     dst = get_fullpath(id, path);
                 }
@@ -197,6 +198,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
             if (file_id < 0)
                 return -2;  // critical error, was in cache, buf no file
             src = dst = get_fullpath(file_id, path);
+            write_etry_new = false;
             break;
         }
         size_t hdr_size = sizeof(FileHeader);
@@ -217,18 +219,23 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 ret = fs::remove_file(src);
                 break;
             }
-            if (srcHdr->header[0].id == id)
-                new_name = get_fullpath(srcHdr->header[1].id, path);
+            if (srcHdr->header[0].id == id) {
+                new_file_id = srcHdr->header[1].id;
+                new_name = get_fullpath(new_file_id, path);
+            }
         }
         int next_pos = NFILES;
-        for (int i = 0; i < NFILES; i++)
-            if (srcHdr->header[i].offset == 0 || srcHdr->header[i].id > id) {
-                next_pos = i;
-                break;
-            }
-        assert(next_pos > 0);
-        if (opp == Opp::UPDATE || opp == Opp::DELETE)
-            assert(srcHdr->header[next_pos-1].id == id);
+        if (read_write_after) {
+            for (int i = 0; i < NFILES; i++)
+                if (srcHdr->header[i].offset == 0 ||
+                    srcHdr->header[i].id > id) {
+                    next_pos = i;
+                    break;
+                }
+            assert(next_pos > 0);
+            if (opp == Opp::UPDATE || opp == Opp::DELETE)
+                assert(srcHdr->header[next_pos-1].id == id);
+        }
         size_t bytes = 0;  // how much data to move, if any
         if (read_write_after) {
             for (int i = next_pos; i < NFILES; i++) {
@@ -237,19 +244,27 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 bytes += srcHdr->header[i].size;
             }
         }
-        int dst_pos = (src == dst) ? (next_pos - 1) : 0;
+        int dst_pos = (src == dst) ? (next_pos - 1 + pos_shift) : 0;
         if (read_write_after && bytes == 0)
             read_write_after = false;  // nothing to write
-        size_t offset, size;
+        size_t offset;
         int shift;
-        // At first read data
+        // At first read data (to move) if any
         if (read_write_after) {
             offset = srcHdr->header[next_pos].offset;
-            size = srcHdr->header[next_pos].size;
-            cbuf.reserve(size);
+            cbuf.resize(bytes);
+            assert(cbuf.size() == bytes);
             fs::read_file(src, cbuf.data(), cbuf.size(), offset);
         }
         // Then update header(s)
+        if (opp == Opp::INSERT && src != dst) {
+            dstHdr->header[0].offset = hdr_size;
+            dstHdr->header[0].size = data.size();
+            dstHdr->header[0].id = id;
+        } else if (opp == Opp::UPDATE && !read_write_after) {
+            shift = data.size() - dstHdr->header[dst_pos].size;
+            dstHdr->header[dst_pos].size = data.size();
+        }
         int n_rows = 0;
         if (read_write_after) {
             switch (opp) {
@@ -263,8 +278,6 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 if (src == dst) {
                     shift = data.size();
                 } else {  // new file
-                    dstHdr->header[0].offset = hdr_size;
-                    dstHdr->header[0].size = data.size();
                     shift = hdr_size + data.size() -
                             srcHdr->header[next_pos].offset;
                 }
@@ -276,29 +289,39 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 srcHdr->header[i].offset += shift;  // update offsets
                 n_rows++;
             }
-            int pos_shift = 1;
-            if (opp == Opp::DELETE)
-                pos_shift = 0;
-            if (src != dst || (dst_pos + pos_shift) != next_pos)
-                memmove(&dstHdr->header[dst_pos + pos_shift],
+            if (src != dst || dst_pos != next_pos)
+                memmove(&dstHdr->header[dst_pos],
                         &srcHdr->header[next_pos],
                         sizeof(Entry) * n_rows);
-            if (opp != Opp::DELETE)  // no need to update offset
+            else if (shift)  // update size (INSERT/UPDATE)
                 dstHdr->header[dst_pos].size = data.size();
-            else
-                srcHdr->header[next_pos + n_rows - 1].offset = 0;
-            if (opp == Opp::INSERT && src != dst) {
+            if (opp == Opp::INSERT && src == dst)
+                dstHdr->header[dst_pos].id = id;
+            if (opp == Opp::INSERT && src != dst) {  // invalidate src's entries
                 for (int i = next_pos; i < NFILES; i++)
                     srcHdr->header[i].offset = 0;
             }
+        } else if (opp == Opp::INSERT && src == dst) {
+            dstHdr->header[dst_pos].offset = dstHdr->header[dst_pos-1].offset
+                                           + dstHdr->header[dst_pos-1].size;
+            dstHdr->header[dst_pos].size = data.size();
+            dstHdr->header[dst_pos].id = id;
         }
+        if (opp == Opp::DELETE)  // invalidate last entry
+            dstHdr->header[dst_pos + n_rows].offset = 0;
         // Write updated header(s)
-        write_header(src, srcHdr);
-        write_header(dst, dstHdr);
+        if (srcHdr)
+            write_header(src, srcHdr);
+        if (dstHdr != srcHdr)
+            write_header(dst, dstHdr);
         // And finally write data
         if (write_etry_new) {  // write new entry to dst, if needed
+            bool _truncate = false;  // local variable
+            if (opp == Opp::UPDATE && src == dst && !read_write_after &&
+                shift < 0)
+                _truncate = true;
             fs::write_file(dst, data.c_str(), data.size(),
-                           dstHdr->header[dst_pos].offset);
+                           dstHdr->header[dst_pos].offset, _truncate);
             dst_pos++;
         }
         if (read_write_after) {
@@ -316,15 +339,25 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
         break;
     }
     // resource deallocation and error handling
-    if (opp == Opp::INSERT)
+    if (opp == Opp::INSERT) {
         cache.insert(id);  // add entry
+        if (src == dst)
+            space[file_id]++;
+        else
+            space[id] = 1;
+    }
+    if (opp == Opp::DELETE && space.count(file_id))
+        space[file_id]--;
     if (srcHdr)
         delete srcHdr;
     if (dstHdr != srcHdr)
         delete dstHdr;
-    if (new_name.length() > 0)
+    if (new_name.length() > 0) {  // to get rid of new_name
         if (fs::rename_file(dst, new_name) != 0)
             ret = -1;
+        space[new_file_id] = space[file_id];
+        space.erase(file_id);
+    }
     if (ret)
         return ret;
     return 0;
