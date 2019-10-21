@@ -35,6 +35,7 @@ class DiskDocumentDB : public DocumentDB {
     ~DiskDocumentDB() {std::cout << "An instance of DocDB is destroyed\n";}
     bool exists(ID id) const override {return vfs.exists(id);}
     int get(ID id, Document* doc) const override {
+        doc->id = id;
         return vfs.get(id, doc->data);
     };
     int remove(ID id) override {return vfs.remove(id);};
