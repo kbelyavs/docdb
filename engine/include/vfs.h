@@ -24,12 +24,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-#include <dirent.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-
-#include <fstream>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -37,89 +31,8 @@ SOFTWARE.
 #include <map>
 #include <mutex>
 
-std::string current_dir() {
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        return std::string(cwd);
-    } else {
-        std::cerr << "getcwd() error: " << std::strerror(errno) << std::endl;
-        exit(-1);
-    }
-}
-
-void touch_dir(const std::string &path) {
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0 && info.st_mode & S_IFDIR)
-        return;
-    if (mkdir(path.c_str(), 0777) != 0) {
-        std::cerr << "touch_dir() error: " << std::strerror(errno) << std::endl;
-        exit(-1);
-    }
-}
-
-void get_files(const std::string &path, std::vector<std::string> *files) {
-    DIR *dir;
-    struct dirent *ent;
-    if ((dir = opendir(path.c_str())) != NULL) {
-        while ((ent = readdir(dir)) != NULL)
-            files->push_back(ent->d_name);
-        closedir(dir);
-    } else {
-        std::cerr << "get_files() error: " << std::strerror(errno) << std::endl;
-        exit(-1);
-    }
-}
-
-int read_file(const std::string &path, char *buf, size_t size,
-              size_t offset = 0) {
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) {
-        std::ifstream file(path);
-        if (offset)
-            file.seekg(offset);
-        file.read(buf, size);
-        if (file.good())
-            return 0;
-    }
-    return -1;
-}
-
-int write_file(const std::string &path, const char *buf, size_t size,
-               size_t offset = 0, bool need_truncate = false) {
-    struct stat info;
-    if ((stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) && size) {
-        std::ofstream outfile;
-        bool good = true;
-        if (size) {
-            outfile.open(path);
-            if (offset)
-                outfile.seekp(offset);
-            outfile.write(buf, size);
-            good = outfile.good();
-        }
-        if (good && need_truncate)
-            return truncate(path.c_str(), size + offset);
-        return good ? 0 : -1;
-    }
-    return -1;
-}
-
-int remove_file(const std::string &path) {
-    return remove(path.c_str());
-}
-
-int rename_file(const std::string &oldname, const std::string &newname) {
-    return rename(oldname.c_str(), newname.c_str());
-}
-
-// Up - fs, Bottom - VFS engine
-
-const int NFILES = 10;
-
-const char FILE_EXT[] = ".db";
-const int EXT_LEN = strlen(FILE_EXT);
-const int NDIGITS = 20;
-const int FLENGTH = NDIGITS + EXT_LEN;
+#include "fs.h"
+#include "constants.h"
 
 bool check_format(const std::string &name) {
     if (name.length() != FLENGTH || name.substr(NDIGITS, EXT_LEN) != FILE_EXT)
@@ -141,18 +54,19 @@ struct FileHeader {
 };
 
 int read_header(const std::string &path, FileHeader *hdr) {
-    int ret = read_file(path, reinterpret_cast<char*>(hdr), sizeof(FileHeader));
+    int ret = fs::read_file(path, reinterpret_cast<char*>(hdr),
+                            sizeof(FileHeader));
     if (ret != 0) {
-        std::cout << "Critical error: can't read " << path << " header\n";
+        std::cerr << "Critical error: can't read " << path << " header\n";
     }
     return ret;
 }
 
 int write_header(const std::string &path, const FileHeader *hdr) {
-    int ret = write_file(path, reinterpret_cast<const char*>(hdr),
-                         sizeof(FileHeader));
+    int ret = fs::write_file(path, reinterpret_cast<const char*>(hdr),
+                             sizeof(FileHeader));
     if (ret != 0) {
-        std::cout << "Critical error: can't read " << path << " header\n";
+        std::cerr << "Critical error: can't write " << path << " header\n";
     }
     return ret;
 }
@@ -170,7 +84,7 @@ enum class Opp { INSERT, UPDATE, DELETE };
 
 class VFS {
  public:
-    VFS(): path(current_dir() + "/db") { recover(); }
+    VFS(): path(fs::current_dir() + "/db") { recover(); }
     bool exists(ID id) const {lock_guard<mutex> l(mtx); return cache.count(id);}
     int get(ID, std::string&) const;
     int remove(ID id) { return do_magic(id, Opp::DELETE, empty); }
@@ -224,7 +138,7 @@ int VFS::get(ID id, std::string &data) const {
                 size_t size = hdr.header[i].size;
                 size_t offset = hdr.header[i].offset;
                 std::vector<char> cbuf(size);
-                if (read_file(fullpath, cbuf.data(), size, offset) != 0)
+                if (fs::read_file(fullpath, cbuf.data(), size, offset) != 0)
                     return -1;
                 data = std::string(cbuf.data(), size);
                 return 0;
@@ -251,7 +165,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
     bool read_entry = false;
     bool write_etry_new = true;  // need to write new value (INSERT/UPDATE)
     bool read_write_after = true;  // move data after insert/update/delete row
-    bool need_truncate = true;
+    bool truncate = true;
     FileHeader *srcHdr = nullptr, *dstHdr = nullptr;
     int ret = -1;  // an error by default
     std::vector<char> cbuf;
@@ -262,13 +176,13 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 src = get_fullpath(file_id, path);
                 if (space[file_id] < NFILES) {  // enough space
                     dst = src;
-                    need_truncate = false;
+                    truncate = false;
                 } else {  // new file created, may be data move
                     dst = get_fullpath(id, path);
                 }
             } else {  // new file created, no data move
                 read_write_after = false;
-                need_truncate = false;
+                truncate = false;
                 dst = get_fullpath(id, path);
             }
             break;
@@ -300,7 +214,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 assert(srcHdr->header[0].id == id);
                 assert(srcHdr->header[1].offset == 0);
                 space.erase(file_id);
-                ret = remove_file(src);
+                ret = fs::remove_file(src);
                 break;
             }
             if (srcHdr->header[0].id == id)
@@ -333,7 +247,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
             offset = srcHdr->header[next_pos].offset;
             size = srcHdr->header[next_pos].size;
             cbuf.reserve(size);
-            read_file(src, cbuf.data(), cbuf.size(), offset);
+            fs::read_file(src, cbuf.data(), cbuf.size(), offset);
         }
         // Then update header(s)
         int n_rows = 0;
@@ -383,17 +297,19 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
         write_header(dst, dstHdr);
         // And finally write data
         if (write_etry_new) {  // write new entry to dst, if needed
-            write_file(dst, data.c_str(), data.size(),
-                       dstHdr->header[dst_pos].offset);
+            fs::write_file(dst, data.c_str(), data.size(),
+                           dstHdr->header[dst_pos].offset);
             dst_pos++;
         }
         if (read_write_after) {
-            if (need_truncate && src != dst) {
-                write_file(src, nullptr, 0, offset, true);  // truncate src only
-                need_truncate = false;
+            if (src != dst) {  // truncate src after data shift
+                fs::write_file(src, nullptr, 0, offset, true);
+                truncate = false;  // no need to truncate dst
             }
+            if (shift >= 0)  // no need to truncate dst, since new size >= old
+                truncate = false;
             offset = dstHdr->header[dst_pos].offset;
-            write_file(dst, cbuf.data(), cbuf.size(), offset, need_truncate);
+            fs::write_file(dst, cbuf.data(), cbuf.size(), offset, truncate);
         }
         // end of function body
         ret = 0;
@@ -407,7 +323,7 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
     if (dstHdr != srcHdr)
         delete dstHdr;
     if (new_name.length() > 0)
-        if (rename_file(dst, new_name) != 0)
+        if (fs::rename_file(dst, new_name) != 0)
             ret = -1;
     if (ret)
         return ret;
@@ -416,8 +332,8 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
 
 void VFS::recover() {
     std::vector<std::string> files;
-    touch_dir(path);
-    get_files(path, &files);
+    fs::touch_dir(path);
+    fs::get_files(path, &files);
     for (auto file : files)
         if (check_format(file)) {
             std::cout << file << std::endl;
@@ -432,7 +348,7 @@ void VFS::recover_file(const std::string &file) {
     int nrecords = 0;
     FileHeader hdr;
     lock_guard<mutex> l(mtx);
-    if (read_file(fullpath, reinterpret_cast<char*>(&hdr), sizeof(hdr)) == 0) {
+    if (read_header(fullpath, &hdr) == 0) {
         std::cout << "processing " << file << std::endl;
         for (int i = 0; i < NFILES; i++) {
             if (hdr.header[i].offset == 0)
