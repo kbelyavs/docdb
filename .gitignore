@@ -1,6 +1,7 @@
 # Other
-.vscode
+.vscode/
 db/
+docdb.dSYM/
 
 # Prerequisites
 *.d

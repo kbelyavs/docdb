@@ -289,8 +289,9 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
                 srcHdr->header[i].offset += shift;  // update offsets
                 n_rows++;
             }
-            if (src != dst || dst_pos != next_pos)
-                memmove(&dstHdr->header[dst_pos],
+            int _dst_pos = dst_pos + (write_etry_new ? 1 : 0);
+            if (src != dst || next_pos != _dst_pos)
+                memmove(&dstHdr->header[_dst_pos],
                         &srcHdr->header[next_pos],
                         sizeof(Entry) * n_rows);
             else if (shift)  // update size (INSERT/UPDATE)

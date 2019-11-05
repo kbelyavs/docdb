@@ -8,14 +8,17 @@ objects := $(patsubst %.c,%.o,$(wildcard *.cpp)) $(engine_obj)
 docdb: clean $(objects)
 	$(CXX) $(INC) -o docdb $(objects) $(CXXFLAGS)
 
+debug: CXXFLAGS += --debug
+debug: docdb
+
 test: docdb lint
 	./docdb
 
-#perf: docdb
-#	time ./docdb
+perf: docdb
+	time ./docdb
 
 lint:
-	cpplint --filter=-build/include_subdir,-build/c++11 --recursive *
+	cpplint --recursive *
 
 clean:
-	rm -f docdb
+	rm -rf docdb db/ docdb.dSYM/
