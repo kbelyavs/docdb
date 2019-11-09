@@ -77,7 +77,7 @@ std::string get_fullpath(ID id, const std::string &rel_path) {
     return rel_path + "/" + std::string(name);
 }
 
-using std::mutex;
+using std::recursive_mutex;
 using std::lock_guard;
 using ID = int64_t;
 enum class Opp { INSERT, UPDATE, DELETE };
@@ -85,8 +85,10 @@ enum class Opp { INSERT, UPDATE, DELETE };
 class VFS {
  public:
     VFS(): path(fs::current_dir() + "/db") { recover(); }
-    bool exists(ID id) const {lock_guard<mutex> l(mtx); return cache.count(id);}
-    int get(ID, std::string&) const;
+    bool exists(ID id) const {
+        return get(id, empty, false) == 0 ? true : false;
+    }
+    int get(ID, std::string&, bool read = true) const;
     int remove(ID id) { return do_magic(id, Opp::DELETE, empty); }
     int update(ID id, const std::string &data) {
         return do_magic(id, Opp::UPDATE, data);
@@ -100,10 +102,9 @@ class VFS {
     void recover();
     void recover_file(const std::string&);
     std::string path;
-    mutable mutex mtx;
+    mutable recursive_mutex mtx;
     std::map<ID, int> space;  // keep number of entries in closest DB file
-    std::unordered_set<ID> cache;  // to check if record exists
-    const std::string empty = "";
+    mutable std::string empty = "";  // place holder
 };
 
 ID VFS::find_file(ID id) const {
@@ -114,43 +115,40 @@ ID VFS::find_file(ID id) const {
     return it->first;
 }
 
-int VFS::get(ID id, std::string &data) const {
-    lock_guard<mutex> l(mtx);
-    if (cache.count(id) == 0)
-        return -1;
+int VFS::get(ID id, std::string &data, bool read) const {
+    lock_guard<recursive_mutex> l(mtx);
     ID file_id = find_file(id);
-    if (file_id < 0) {
-        std::cerr << "Critical error: exists in cache, but no file found\n";
+    if (file_id < 0)
         return -1;
-    }
-    if (space.at(file_id) == 0) {
-        std::cerr << "Critical error: exists in cache, but the file is empty\n";
-        return -1;
-    }
     std::string fullpath = get_fullpath(file_id, path);
+    if (space.at(file_id) == 0) {
+        std::cerr << "Critical error: file " << fullpath << " is empty\n";
+        return -1;
+    }
     FileHeader hdr;
     if (read_header(fullpath, &hdr) == 0) {
         for (int i = 0; i < NFILES; i++) {
             if (hdr.header[i].offset == 0 || hdr.header[i].id > id) {
                 break;
             } else if (hdr.header[i].id == id) {
-                size_t size = hdr.header[i].size;
-                size_t offset = hdr.header[i].offset;
-                std::vector<char> cbuf(size);
-                if (fs::read_file(fullpath, cbuf.data(), size, offset) != 0)
-                    return -1;
-                data = std::string(cbuf.data(), size);
+                if (read) {
+                    size_t size = hdr.header[i].size;
+                    size_t offset = hdr.header[i].offset;
+                    std::vector<char> cbuf(size);
+                    if (fs::read_file(fullpath, cbuf.data(), size, offset) != 0)
+                        return -1;
+                    data = std::string(cbuf.data(), size);
+                }
                 return 0;
             }
         }
     }
-    std::cerr << "Critical error: exists in cache, but not found in file\n";
     return -1;
 }
 
 int VFS::do_magic(ID id, Opp opp, const std::string &data) {
-    lock_guard<mutex> l(mtx);
-    if (cache.count(id) > 0) {
+    lock_guard<recursive_mutex> l(mtx);
+    if (exists(id) > 0) {  // to optimize, if found, store header.
         if (opp == Opp::INSERT)
             opp = Opp::UPDATE;
     } else {
@@ -188,15 +186,10 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
             }
             break;
         case Opp::UPDATE:
-            if (file_id < 0)
-                return -2;  // critical error, exists in cache, buf no file
             read_entry = true;
             src = dst = get_fullpath(file_id, path);
             break;
         case Opp::DELETE:
-            cache.erase(id);  // in any case, remove entry
-            if (file_id < 0)
-                return -2;  // critical error, was in cache, buf no file
             src = dst = get_fullpath(file_id, path);
             write_etry_new = false;
             break;
@@ -341,7 +334,6 @@ int VFS::do_magic(ID id, Opp opp, const std::string &data) {
     }
     // resource deallocation and error handling
     if (opp == Opp::INSERT) {
-        cache.insert(id);  // add entry
         if (src == dst)
             space[file_id]++;
         else
@@ -381,13 +373,12 @@ void VFS::recover_file(const std::string &file) {
     std::cout << fullpath << " " << id << std::endl;
     int nrecords = 0;
     FileHeader hdr;
-    lock_guard<mutex> l(mtx);
+    lock_guard<recursive_mutex> l(mtx);
     if (read_header(fullpath, &hdr) == 0) {
         std::cout << "processing " << file << std::endl;
         for (int i = 0; i < NFILES; i++) {
             if (hdr.header[i].offset == 0)
                 break;
-            cache.insert(hdr.header[i].id);
             nrecords++;
         }
         space[id] = nrecords;
