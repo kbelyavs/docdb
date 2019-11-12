@@ -25,11 +25,13 @@ SOFTWARE.
 */
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <errno.h>
 
-#include <fstream>
 #include <vector>
 #include <string>
 
@@ -70,41 +72,83 @@ void get_files(const std::string &path, std::vector<std::string> *files) {
 
 int read_file(const std::string &path, char *buf, size_t size,
               size_t offset = 0) {
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) {
-        std::ifstream file(path, std::ios::binary);
-        if (offset)
-            file.seekg(offset);
-        file.read(buf, size);
-        if (file.good())
-            return 0;
+    int fd, ret;
+    while ((fd = open(path.c_str(), O_RDWR)) == -1) {
+        if (errno == EINTR)
+            continue;
+        perror("open");
+        return -1;
     }
-    return -1;
+    while (size > 0 && (ret = pread(fd, buf, size, offset)) != 0) {
+        if (ret == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("pread");
+            return -1;
+        }
+        size -= ret;
+        buf += ret;
+    }
+    while (close(fd) == -1) {
+        if (errno == EINTR)
+            continue;
+        perror("close");
+        return -1;
+    }
+    return 0;
 }
 
 int write_file(const std::string &path, const char *buf, size_t size,
                size_t offset = 0, bool need_truncate = false) {
-    struct stat info;
-    if ((stat(path.c_str(), &info) == 0 && info.st_mode & S_IFREG) || size) {
-        bool good = true;
-        if (size) {
-            std::ofstream outfile(path,
-                std::ios::binary | std::ios::in | std::ios::out);
-            if (outfile.tellp() == -1) {  // new file
-                assert(offset == 0);
-                outfile.open(path, std::ios::binary);
-            }
-            if (offset)
-                outfile.seekp(offset);
-            outfile.write(buf, size);
-            outfile.close();
-            good = outfile.good();
-        }
-        if (good && need_truncate)
-            return truncate(path.c_str(), size + offset);
-        return good ? 0 : -1;
+    int fd;
+    while ((fd = open(path.c_str(), O_RDWR)) == -1) {
+        if (errno == EINTR)
+            continue;
+        break;
     }
-    return -1;
+    while (fd == -1) {  // not exist? try create
+        fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
+        if (fd == -1) {
+            perror("open");
+            return -1;
+        }
+    }
+    if (size) {
+        if (offset && lseek(fd, offset, SEEK_SET) == -1) {
+            perror("lseek");
+            return -1;
+        }
+        int ret, left = size;
+        while (left > 0 && (ret = write(fd, buf, left)) != 0) {
+            if (ret == -1) {
+                if (errno == EINTR)
+                    continue;
+                perror("write");
+                return -1;
+            }
+            left -= ret;
+            buf += ret;
+        }
+    }
+    while (need_truncate && ftruncate(fd, size + offset) == -1) {
+        if (errno == EINTR)
+            continue;
+        perror("ftruncate");
+        return -1;
+    }
+    while (fsync(fd) == -1) {
+        if (errno == EINTR)
+            continue;
+        perror("fsync");
+        return -1;
+    }
+    while (close(fd) == -1) {
+        if (errno == EINTR)
+            continue;
+        perror("close");
+        return -1;
+    }
+    return 0;
 }
 
 int remove_file(const std::string &path) {
